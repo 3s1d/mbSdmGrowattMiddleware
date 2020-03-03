@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf_8 -*-
 """
- Middleware to connect SDM630 indirectly to an Growatt inverter and adding an export budget onto of the readings
+ Middleware to connect SDM630 indirectly to an Growatt inverter and adding an export budget ontop of the readings
+ Additionally provide some stats and an mqtt interface
  This is distributed under GNU LGPL license, see license.txt
 """
 
@@ -17,7 +18,19 @@ import time
 import datetime
 import struct
 from datetime import timezone
+from datetime import date
+from datetime import datetime
+import paho.mqtt.client as mqtt
+import os
 
+#MQTT
+
+broker_url = "localhost"
+broker_port = 1883
+mqttClient = mqtt.Client("sdmGw-%d" % os.getpid())
+mqttLastTx = 0
+
+#RS485
 
 #growatt TX: 01 04 00 0C 00 12 B0 04
 
@@ -52,8 +65,8 @@ def computeVAr(watt, pf):
     return var
 
 def getMeterValues():
-    global running
-    global sdmbus, growattbus, sdmLastExec
+    global mqttClient, mqttLastTx
+    global running, sdmbus, growattbus, sdmLastExec
     global whImportToday, whExportToday, whToday_lock
     global today
 
@@ -70,7 +83,6 @@ def getMeterValues():
     sdmLastExec = current
     #logger.debug(dt)
 
-    #logger.debug(sdmReg)
     if len(sdmReg) >= 12: 
         watt = [sdmReg[0], sdmReg[1], sdmReg[2]]
         pf = [sdmReg[9], sdmReg[10], sdmReg[11]]
@@ -96,10 +108,10 @@ def getMeterValues():
         fakesdm.set_values('power', 12, sbuf)
 
         #mqtt stuff
-        w = {'date': datetime.datetime.today()}
+        w = {'date': datetime.today()}
         for i in range(0, len(watt)):
             w['L%d'%(i+1)] = watt[i]
-        #todo mqtt export
+        mqttClient.publish(topic='/sdmGw/power_quick', payload=json.dumps(w, default=json_util.default))
         #logger.debug(w)
 
         #integrate Wh
@@ -114,42 +126,52 @@ def getMeterValues():
                 elif wh < 0.0:
                     whExportToday += wh
                 #logger.debug("import %f, export %f", whImportToday, whExportToday)
-                kwh = {'date': today, 'imp_kWh': whImportToday / 1000.0, 'exp_kWh': whExportToday / 1000.0}  
-                #logger.debug(kwh)
-        #export only now and then? every 10sec?
+                
+        #export every 5sec
+        if current - mqttLastTx >= 5:
+            mqttLastTx = current
+            dati = datetime.combine(today, datetime.min.time())
+            kwh = {'date': dati, 'imp_kWh': whImportToday / 1000.0, 'exp_kWh': whExportToday / 1000.0}  
+            mqttClient.publish(topic='/sdmGw/power', payload=json.dumps(w, default=json_util.default))
+            mqttClient.publish(topic='/sdmGw/today', payload=json.dumps(kwh, default=json_util.default))
 
 
 def main():
     """main"""
-    global running
-    global sdmbus, growattbus, today
+    global mqttClient
+    global running, sdmbus, growattbus, today
     global whImportToday, whExportToday, whToday_lock
 
     try:
+        mqttClient.connect(broker_url, broker_port)
+        mqttClient.loop_start()
+
         #Connect to the slave
         sdmbus = modbus_rtu.RtuMaster(serial.Serial(port=SDMPORT, baudrate=9600, bytesize=8, parity='N', stopbits=1, xonxoff=0))
-        sdmbus.set_timeout(5.0)
-        sdmbus.set_verbose(True)
+        sdmbus.set_timeout(0.5)
+        #sdmbus.set_verbose(True)
         growattbus = modbus_rtu.RtuServer(serial.Serial(GROWATTPORT, baudrate=9600, bytesize=8, parity='N', stopbits=1, xonxoff=0))
         growattbus.set_timeout(0.1)
         growattbus.set_verbose(True)
         growattbus.start()
+
+        # add fake sdm to growatt bus
         fakesdm = growattbus.add_slave(1)
         fakesdm.add_block('power', cst.ANALOG_INPUTS, 12, 18);
 
         logger.info("connected")
-        today = datetime.datetime.today().date()
+        today = datetime.today().date()
 
         #start collecting data
         getMeterValues()
 
         while True:
             time.sleep(60)
-            if today != datetime.datetime.today().date():
+            if today != datetime.today().date():
                 with whToday_lock:
                     logger.info("day change: imp=%.1fkWh exp=%.1fkWh", whImportToday/1000.0, whExportToday/1000.0)
                     #todo store into mongoDB
-                    today = datetime.datetime.today().date()
+                    today = datetime.today().date()
                     whImportToday = 0.0
                     whExportToday = 0.0
 
@@ -162,6 +184,7 @@ def main():
         running = False
     finally:
         growattbus.stop()
+        mqttClient.loop_stop()
 
     time.sleep(2)
 
